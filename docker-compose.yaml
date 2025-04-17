@@ -1,0 +1,17 @@
+version: '3.8'
+
+services:
+  webapp:
+    image: brighttoh/sandbox_repo:webapp_v1
+    ports: 
+      - "8082:80"
+    volumes:
+      - webapp_volume:/var/www/html/wepapp
+    networks:
+    - webapp_network
+
+volumes:
+  webapp_volume:
+
+networks:
+  webapp_network:
