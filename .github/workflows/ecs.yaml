@@ -1,0 +1,93 @@
+# Name of workflow
+name: Build and deploy to ECS
+
+# Trigger
+on:
+  push:
+    branches:
+      - main
+
+# Job definitions
+jobs:
+  build-deploy:
+    runs-on: ubuntu-latest # Specify the type of runner to be allocated for the job.
+    permissions: # Define permissions for the job.
+      contents: read # This is required for actions/checkout. Permission to read contents on to the job runner.
+      packages: write # Permission to write to github packages.
+      id-token: write   # This is required for requesting the JWT
+
+    steps:
+      # Clone repository into the runner
+      - name: clone repo
+        uses: actions/checkout@v3  # Clone the reopsitory onto the runner.
+      
+      # Install java and maven on the runner
+      - name: set up java and maven
+        uses: actions/setup-java@v3 # This action will automatically help us set up java and maven.
+        with: # The setup-java action needs some parameters that must be set to use the action.
+          distribution: 'adopt' # This parameter specifies the distribution of java we want to use.
+          java-version: '11' # This parameter specifies the version of java we want to use.
+      
+      # Create artifact with maven
+      - name: package artifact
+        run: mvn package # Maven validate, compile, unit test, package the code into an artifact.
+      
+      - name: code analysis with sonarqube
+        # The following run command is gotten from your sonarqube server used to have github actions connect to the sonarqube server for code analysis and testing.
+        run: mvn sonar:sonar -Dsonar.projectKey=xashy-webapp-project -Dsonar.host.url=${{secret.SONAR_HOST_URL}} -Dsonar.token=${{secret.SONAR_LOGIN_TOKEN}}
+      
+      # Publish artifact to github packages
+      - name: publish to github packages
+        run: mvn --batch-mode deploy
+        env:
+          GITHUB_TOKEN: ${{secret.GITHUB_TOKEN}}
+
+      # Have github actions authenticate to AWS through OIDC
+      # https://github.com/marketplace/actions/configure-aws-credentials-action-for-github-actions
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4.1.0
+        with:
+          role-to-assume: arn:aws-cn:iam::123456789100:role/my-github-actions-role # Replace with the OIDC role from your account.
+          audience: sts.amazonaws.com.cn
+          aws-region: us-east-1
+      
+      # Login to an ECR private repository.
+      # Github actions uses docker to login to ECR. Docker already installed on every github runner for github actions.
+      # https://github.com/marketplace/actions/amazon-ecr-login-action-for-github-actions
+      - name: login to amazon ecr
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # Use docker to containerize artifact
+      # We do not install docker because, every runner that github provides, automatically have a runner installed on it.
+      - name: Build, tag and push image to an image repository
+        id: build-image
+        env:
+          REGISTRY: ${{steps.login-ecr.outputs.registry}} # The output generated from the ECR login step above, passed.
+          REPOSITORY: xashy-webapp # Name of ECR repository
+          IMAGE_TAG: $((github.sha))
+          # How to call a env variable after definition: $[name_of_variable]
+        run: |
+          docker build -t $REGISTRY/$REPOSITORY:$IMAGE_TAG ./
+          docker push $REGISTRY/$REPOSITORY:$IMAGE_TAG
+          echo "image=$REGISTRY/$REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
+
+      # Create a new revision of the task definition
+      # https://github.com/aws-actions/amazon-ecs-render-task-definition
+      - name: create new revision of the task definition
+        id: task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-definition.json # name of your ecs task definition file in your project directory.
+          container-name: xashy-webapp-container
+          image: ${{steps.build-image.outputs.image}}
+
+      # Update the ECS service with new task definition revision
+      # https://github.com/aws-actions/amazon-ecs-deploy-task-definition
+      - name: update service with new revision.
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{steps.yask-def.outputs.task-definition}}
+          service: xashy-webapp-service
+          cluster: xashy-webapp-cluster
+          wait-for-service-stability: true
